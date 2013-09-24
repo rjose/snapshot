@@ -4,76 +4,12 @@ import io
 import os
 import re
 import subprocess
-
 import zmq
 
 from utils.sectionize import sectionize
 
 class CommitError(Exception):
     pass
-
-#TODO: Add functions to create stacked streams (these will eventually go into sectionize)
-
-
-# TODO: Read these ports from the commandline
-reply_port = 5000
-publish_port = 5100
-
-# Create 0mq context
-context = zmq.Context()
-
-# Socket for replying to snapshot requests from users (GETs and PUTs)
-rep_socket = context.socket(zmq.REP)
-rep_socket.bind("tcp://127.0.0.1:%d" % reply_port)
-
-# Socket for publishing changes to resources
-pub_socket = context.socket(zmq.PUB)
-pub_socket.bind("tcp://127.0.0.1:%d" % publish_port)
-
-# TODO: Set this from the commandline (default to current dir)
-working_directory = "/home/rjose/dev/snapshot/temp"
-os.chdir(working_directory)
-
-def commit_file(file):
-    # Add file
-    git_result = subprocess.call("git add %s" % file, shell=True)
-    if git_result != 0:
-        raise CommitError("Problem adding %s" % file)
-
-    # Commit file
-    git_result = subprocess.call("git commit -m 'Update %s'" % file, shell=True)
-
-    # TODO: Check if file hasn't changed
-    #if git_result != 0:
-    #    socket.send("ERROR: Couldn't commit raw/qplan.txt")
-    #    raise Exception("Problem commiting raw/qplan.txt")
-
-
-def put_resource(header, data, header_map):
-    resource = header.split("PUT ")[1]
-    filename = header_map[resource]
-    dirname = os.path.dirname(filename)
-    # TODO: Test this at least once
-    if not os.path.exists(dirname):
-        os.makedirs(dirname)
-
-    # Write data to file
-    file = open(filename, "w")
-    file.write(data);
-    file.close()
-
-    # Check file in
-    try:
-        commit_file(filename)
-
-        # Publish that file was checked in
-        pub_socket.send_unicode("=====%s" % resource);
-        print(resource)
-
-        # Reply to client that PUT file
-        rep_socket.send("OK")
-    except CommitError:
-        rep_socket.send_unicode("ERROR: Couldn't commit PUT %s" % resource)
 
 # TODO: Move this to sectionize
 def make_sections(section_lists):
@@ -86,53 +22,133 @@ def make_sections(section_lists):
     return result
 
 
-def get_resource(header, data, header_map):
-    resource = header.split("GET ")[1]
-    filename = header_map[resource]
-    version = data.split("\t")[0]
-    if not version:
-        version = "HEAD"
-    print("Getting data for %s, %s" % (header, version))
+class SnapshotService:
+    """Manages snapshotting data files"""
 
-    p = subprocess.Popen("git show %s:%s" % (version, filename),
-            stdout=subprocess.PIPE, shell=True)
-    contents = io.StringIO(p.communicate()[0])
+    #===========================================================================
+    # Public API
+    #
 
-    p = subprocess.Popen("git rev-parse %s" % version,
-            stdout=subprocess.PIPE, shell=True)
-    rev = p.communicate()[0][0:5]
+    def __init__(self, header_file_map, repo_dir, reply_port, publish_port):
+        self.header_file_map = header_file_map
+        context = zmq.Context()
 
-    data = []
-    for l in contents.readlines():
-        data.append("\t%s" % l)
-    new_contents = "".join(data)
-    message = make_sections([["raw qplan", "\t%s\n" % rev], ["data", new_contents]])
-    rep_socket.send_unicode(message)
+        # Socket for replying to snapshot requests from users (GETs and PUTs)
+        self.rep_socket = context.socket(zmq.REP)
+        self.rep_socket.bind("tcp://127.0.0.1:%d" % reply_port)
+        
+        # Socket for publishing changes to resources
+        self.pub_socket = context.socket(zmq.PUB)
+        self.pub_socket.bind("tcp://127.0.0.1:%d" % publish_port)
+
+        # Set working directory to the repo
+        os.chdir(repo_dir)
 
 
-def event_loop(header_map):
-    while True:
-        message = io.StringIO(rep_socket.recv())
-        # TODO: Handle errors in sectionizing
-        sections = sectionize(message)
+    def run(self):
+        try:
+            while True:
+                message = io.StringIO(self.rep_socket.recv())
+                # TODO: Handle errors in sectionizing
+                sections = sectionize(message)
+        
+                for header in sections.keys():
+                    if re.match("PUT", header):
+                        self.put_resource(header, sections[header], self.header_file_map)
+                    elif re.match("GET", header):
+                        self.get_resource(header, sections[header], self.header_file_map)
+                    else:
+                        print(header)
+                        self.rep_socket.send_unicode("TODO: Handle %s" % header)
+        except Exception as e:
+            print("EXCEPTION: %s" % str(e))
 
-        for header in sections.keys():
-            if re.match("PUT", header):
-                put_resource(header, sections[header], header_map)
-            elif re.match("GET", header):
-                get_resource(header, sections[header], header_map)
-            else:
-                print(header)
-                rep_socket.send_unicode("TODO: Handle %s" % header)
+
+    #===========================================================================
+    # Internal functions
+    #
+
+    def commit_file(self, file):
+        # Add file
+        git_result = subprocess.call("git add %s" % file, shell=True)
+        if git_result != 0:
+            raise CommitError("Problem adding %s" % file)
+    
+        # Commit file
+        git_result = subprocess.call("git commit -m 'Update %s'" % file, shell=True)
+    
+        # TODO: Check if file hasn't changed
+        #if git_result != 0:
+        #    socket.send("ERROR: Couldn't commit raw/qplan.txt")
+        #    raise Exception("Problem commiting raw/qplan.txt")
+
+
+    def put_resource(self, header, data, header_map):
+        resource = header.split("PUT ")[1]
+        filename = header_map[resource]
+        dirname = os.path.dirname(filename)
+        # TODO: Test this at least once
+        if not (os.path.exists(dirname) or dirname == ""):
+            os.makedirs(dirname)
+    
+        # Write data to file
+        file = open(filename, "w")
+        file.write(data);
+        file.close()
+    
+        # Check file in
+        try:
+            self.commit_file(filename)
+    
+            # Publish that file was checked in
+            self.pub_socket.send_unicode("=====%s" % resource);
+    
+            # Reply to client that PUT file
+            self.rep_socket.send("OK")
+        except CommitError:
+            self.rep_socket.send_unicode("ERROR: Couldn't commit PUT %s" % resource)
+    
+    
+    def get_resource(self, header, data, header_map):
+        resource = header.split("GET ")[1]
+        filename = header_map[resource]
+        version = data.split("\t")[0]
+        if not version:
+            version = "HEAD"
+        print("Getting data for %s, %s" % (header, version))
+    
+        p = subprocess.Popen("git show %s:%s" % (version, filename),
+                stdout=subprocess.PIPE, shell=True)
+        contents = io.StringIO(p.communicate()[0])
+    
+        p = subprocess.Popen("git rev-parse %s" % version,
+                stdout=subprocess.PIPE, shell=True)
+        rev = p.communicate()[0][0:5]
+    
+        data = []
+        for l in contents.readlines():
+            data.append("\t%s" % l)
+        new_contents = "".join(data)
+        message = make_sections([["raw qplan", "\t%s\n" % rev], ["data", new_contents]])
+        self.rep_socket.send_unicode(message)
+
+
 
 
 #===============================================================================
 # Code that should be in a custom script
 #
+# TODO: Read these ports from the commandline
+reply_port = 5000
+publish_port = 5100
+working_directory = "/home/rjose/dev/snapshot/temp"
+
 header_file_map = {
         "qplan raw": "qplan_raw.txt",
         "qplan cond": "qplan_cond.txt",
         "qplan app": "qplan_app.txt"
 }
-event_loop(header_file_map)
 
+service = SnapshotService(header_file_map, working_directory,
+                                                    reply_port, publish_port)
+service.run()
