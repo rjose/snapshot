@@ -29,6 +29,9 @@ class SnapshotService:
     # Public API
     #
 
+    #---------------------------------------------------------------------------
+    # Sets up 0mq sockets and repo to use for snapshot data.
+    #
     def __init__(self, header_file_map, repo_dir, reply_port, publish_port):
         self.header_file_map = header_file_map
         context = zmq.Context()
@@ -45,11 +48,13 @@ class SnapshotService:
         os.chdir(repo_dir)
 
 
+    #---------------------------------------------------------------------------
+    # Event loop for handling snapshot PUT/GET requests.
+    #
     def run(self):
         try:
             while True:
                 message = io.StringIO(self.rep_socket.recv())
-                # TODO: Handle errors in sectionizing
                 sections = sectionize(message)
         
                 for header in sections.keys():
@@ -62,12 +67,16 @@ class SnapshotService:
                         self.rep_socket.send_unicode("TODO: Handle %s" % header)
         except Exception as e:
             print("EXCEPTION: %s" % str(e))
+            self.rep_socket.send_unicode("ERROR: %s" % str(e))
 
 
     #===========================================================================
     # Internal functions
     #
 
+    #---------------------------------------------------------------------------
+    # Wraps git to commit data to repo.
+    #
     def commit_file(self, file):
         # Add file
         git_result = subprocess.call("git add %s" % file, shell=True)
@@ -83,6 +92,9 @@ class SnapshotService:
         #    raise Exception("Problem commiting raw/qplan.txt")
 
 
+    #---------------------------------------------------------------------------
+    # Writes a new data snapshot to database.
+    #
     def put_resource(self, header, data, header_map):
         resource = header.split("PUT ")[1]
         filename = header_map[resource]
@@ -109,46 +121,33 @@ class SnapshotService:
             self.rep_socket.send_unicode("ERROR: Couldn't commit PUT %s" % resource)
     
     
+
+    #---------------------------------------------------------------------------
+    # Retrieves data snapshot.
+    #
     def get_resource(self, header, data, header_map):
-        resource = header.split("GET ")[1]
-        filename = header_map[resource]
-        version = data.split("\t")[0]
-        if not version:
-            version = "HEAD"
-        print("Getting data for %s, %s" % (header, version))
+        try:
+            resource = header.split("GET ")[1]
+            filename = header_map[resource]
+            version = data.split("\t")[0]
+            if not version:
+                version = "HEAD"
+            print("Getting data for %s, %s" % (header, version))
     
-        p = subprocess.Popen("git show %s:%s" % (version, filename),
-                stdout=subprocess.PIPE, shell=True)
-        contents = io.StringIO(p.communicate()[0])
+            p = subprocess.Popen("git show %s:%s" % (version, filename),
+                    stdout=subprocess.PIPE, shell=True)
+            contents = io.StringIO(p.communicate()[0])
     
-        p = subprocess.Popen("git rev-parse %s" % version,
-                stdout=subprocess.PIPE, shell=True)
-        rev = p.communicate()[0][0:5]
+            p = subprocess.Popen("git rev-parse %s" % version,
+                    stdout=subprocess.PIPE, shell=True)
+            rev = p.communicate()[0][0:5]
     
-        data = []
-        for l in contents.readlines():
-            data.append("\t%s" % l)
-        new_contents = "".join(data)
-        message = make_sections([["raw qplan", "\t%s\n" % rev], ["data", new_contents]])
-        self.rep_socket.send_unicode(message)
+            data = []
+            for l in contents.readlines():
+                data.append("\t%s" % l)
+            new_contents = "".join(data)
+            message = make_sections([["raw qplan", "\t%s\n" % rev], ["data", new_contents]])
 
-
-
-
-#===============================================================================
-# Code that should be in a custom script
-#
-# TODO: Read these ports from the commandline
-reply_port = 5000
-publish_port = 5100
-working_directory = "/home/rjose/dev/snapshot/temp"
-
-header_file_map = {
-        "qplan raw": "qplan_raw.txt",
-        "qplan cond": "qplan_cond.txt",
-        "qplan app": "qplan_app.txt"
-}
-
-service = SnapshotService(header_file_map, working_directory,
-                                                    reply_port, publish_port)
-service.run()
+            self.rep_socket.send_unicode(message)
+        except:
+            self.rep_socket.send_unicode("ERROR: Couldn't GET %s @ %s" % (resource, version))
